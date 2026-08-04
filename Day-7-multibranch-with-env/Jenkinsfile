@@ -1,0 +1,121 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_DEFAULT_REGION = 'us-east-1'
+        TF_IN_AUTOMATION    = 'true'
+    }
+
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    stages {
+
+        stage('Determine Environment') {
+            steps {
+                script {
+                    // Map branch name to environment / tfvars file
+                    if (env.BRANCH_NAME == 'dev') {
+                        env.TF_ENV     = 'dev'
+                        env.TFVARS     = 'dev.tfvars'
+                        env.AUTO_APPLY = 'true'
+                    } else if (env.BRANCH_NAME == 'test') {
+                        env.TF_ENV     = 'test'
+                        env.TFVARS     = 'test.tfvars'
+                        env.AUTO_APPLY = 'true'
+                    } else if (env.BRANCH_NAME == 'main') {
+                        env.TF_ENV     = 'prod'
+                        env.TFVARS     = 'prod.tfvars'
+                        env.AUTO_APPLY = 'false'   // prod always needs manual approval
+                    } else {
+                        env.TF_ENV     = 'feature'
+                        env.TFVARS     = 'dev.tfvars'
+                        env.AUTO_APPLY = 'false'
+                    }
+                    echo "Branch: ${env.BRANCH_NAME} → Environment: ${env.TF_ENV}"
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Terraform Init') {
+            steps {
+                dir('terraform') {
+                    sh """
+                        terraform init \
+                          -backend-config="key=${env.TF_ENV}/terraform.tfstate" \
+                          -input=false
+                    """
+                }
+            }
+        }
+
+        stage('Terraform Format & Validate') {
+            steps {
+                dir('terraform') {
+                    sh 'terraform fmt -check -recursive'
+                    sh 'terraform validate'
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                dir('terraform') {
+                    sh """
+                        terraform plan \
+                          -var-file=environments/${env.TFVARS} \
+                          -out=tfplan \
+                          -input=false
+                    """
+                }
+            }
+        }
+
+        stage('Approval') {
+            when {
+                expression { env.AUTO_APPLY == 'false' }
+            }
+            steps {
+                input message: "Apply Terraform plan to ${env.TF_ENV}?", ok: 'Apply'
+            }
+        }
+
+        stage('Terraform Apply') {
+            when {
+                anyOf {
+                    branch 'dev'
+                    branch 'test'
+                    branch 'main'
+                }
+            }
+            steps {
+                dir('terraform') {
+                    sh 'terraform apply -input=false -auto-approve tfplan'
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Deployment to ${env.TF_ENV} succeeded."
+        }
+        failure {
+            echo "Pipeline failed for ${env.TF_ENV} — check logs above."
+        }
+        always {
+            dir('terraform') {
+                sh 'rm -f tfplan'
+            }
+        }
+    }
+}
